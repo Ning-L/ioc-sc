@@ -1,0 +1,369 @@
+---
+title: "Convert Cell-cylce Marker Genes Between Species"
+author: Lijiao NING
+date: today
+format:
+  html: 
+    theme: simplex
+    toc: true
+    toc-depth: 3
+  pdf:
+    toc: true
+embed-resources: true
+editor_options: 
+  chunk_output_type: console
+---
+
+In scRNA-seq data analysis, we often include two steps:
+
+- Cell cycle scoring
+- Then correct it as a potential batch effect or source of variation (regress out)
+
+However, in {`Seurat`}, the `CellCycleScoring()` function uses built-in human marker genes from [Tirosh et al., 2016](https://pmc.ncbi.nlm.nih.gov/articles/PMC4944528/).
+
+When we analyze mice, zebrafish, or other model organisms,
+we cannot use these human genes directly.
+This tutorial will show you several ways to retrieve orthologs for a list of genes.
+
+
+## Via brute force 😅
+
+If you want to convert human genes to mouse genes,
+you can try:
+
+```{r}
+stringr::str_to_title(c("MCM5", "PCNA", "TYMS"))
+```
+
+:::{.callout-warning appearance="simple"}
+But it's risky:
+
+- It can create gene symbols that don't exist.
+- There's no guarantee that "Pcna" is the mouse ortholog of "PCNA" (even if it often is).
+:::
+
+Mouse and human gene symbols often follow different case conventions,
+but don’t assume changing the case gives you the ortholog.
+Always use a trusted resource like **g:Profiler**, **Ensembl BioMart** to get verified ortholog mappings.
+
+## Via "g:Profiler"
+
+### Web Interface
+
+1. Go to <https://biit.cs.ut.ee/gprofiler/gorth>,
+or click on the **g:Orth** tab on the [g:Profiler homepage](https://biit.cs.ut.ee/gprofiler/).
+
+2. Paste your list of genes (one per line, can include both symbols and Ensembl IDs) into the **Query** bloc.
+
+3. Set **Options**: select *Input organism* and *Target organism*.
+Then click **Run query**.
+
+4. Click "Export to CSV" to save results. Then you can import the data for cell cycle estimation.
+
+![](images/gprofiler_web.png)
+
+:::{.callout-tip appearance="simple"}
+
+**No Ortholog Found?**
+
+It’s completely normal that sometimes there’s no ortholog match between species.
+
+- Biological reasons:
+  - Some genes are species-specific;
+  - The gene might have lost its ortholog in the other species due to evolution;
+  - There may be functional divergence, where the ortholog exists but has changed too much to be confidently recognized.
+
+- Technical reasons:
+  - The gene symbol or ID may be outdated, misspelled, or not annotated in the reference genome;
+  - The database does not contain some genes or it's outdated.
+  
+:::
+
+
+### R package {`gprofiler2`}
+
+You need to install the [{`gprofiler2`}](https://cran.r-project.org/web/packages/gprofiler2/index.html) package before.
+
+Here is the [vignette](https://cran.r-project.org/web/packages/gprofiler2/vignettes/gprofiler2.html#mapping-homologous-genes-across-related-organisms-with-gorth). We will use the `gorth()` function:
+
+```{r}
+library(gprofiler2)
+suppressPackageStartupMessages(library(Seurat))
+
+# Orthology search
+mmus_s <- gorth(
+  cc.genes.updated.2019$s.genes,
+  source_organism = "hsapiens",
+  target_organism = "mmusculus"
+)$ortholog_name
+mmus_s
+length(cc.genes.updated.2019$s.genes)
+length(mmus_s)
+
+mmus_g2m <- gorth(
+  cc.genes.updated.2019$g2m.genes,
+  source_organism = "hsapiens",
+  target_organism = "mmusculus"
+)$ortholog_name
+mmus_g2m
+
+length(cc.genes.updated.2019$g2m.genes)
+length(mmus_g2m)
+```
+
+> Organism names are constructed by concatenating the first letter of the name and the family name. Example: human - 'hsapiens', mouse - 'mmusculus'.
+
+```{r}
+#| eval: false
+
+# run cell cylce scoring
+seurat_obj <- CellCycleScoring(
+  seurat_obj,
+  s.features = mmus_s,
+  g2m.features = mmus_g2m,
+  set.ident = TRUE
+)
+```
+
+:::{.callout-tip appearance="simple"}
+- If your gene list is long (hundreds+), consider using programmatic tools like R or Python for automation.
+- g:Profiler uses data from Ensembl and Ensembl Genomes, it follows update of Ensembl databases.
+- Ensembl updates gene annotations frequently, check the database version if you're using older datasets.
+:::
+
+## Via "Ensembl"
+
+### Web Interface
+
+1. Open the BioMart interface <https://www.ensembl.org/biomart/martview> or click on the **BioMart** tab on the [Ensembl homepage](https://www.ensembl.org/index.html).
+
+2. Choose **Database** (select "Ensembl Genes xxx") and **Dataset** (select the species of input genes).
+
+3. Add **Filters** (Input your gene list)
+
+  - In the left menu, click on **Filters**
+  - Expand the **GENE** section
+  - Check *Input external references ID list*, find and tick the appropriate gene ID type, *e.g.*: if you use Ensembl ID -> `Gene stable ID(s)`, if you use gene symbol -> `Gene name(s)`.
+  - Paste your list of gene (one per line, can only include **the same ID type**).
+
+4. Choose **Attributes** (What you want in the output)
+
+  - Click on **Attributes** in the left menu
+  - Select **Homologues**
+  - Expand the **GENE** section and tick the information you want of the input species, *e.g.*: `Gene stable ID`, `Gene name`, *etc.*
+  - Select the target species in the **ORTHOLOGUES** sections, and tick the information you want about the target species, *e.g.*: `Mouse gene stable ID`, `Mouse gene name`, *etc.*
+
+![](images/biomart_web1.png)
+
+5. Get the Results
+
+- Click the **Results** button at the top
+- Preview your results
+- Select the output format and click **Go** to download the results.
+
+![](images/biomart_web2.png)
+
+### R package {`biomaRt`}
+
+You need to install the [biomaRt](https://bioconductor.org/packages/release/bioc/html/biomaRt.html) before.
+
+**Principal steps**: species1_symbol -> species1_ensembl_id -> getHomologs() -> species2_ensembl_id -> specie2_symbol -> CellCycleScoring()
+
+1. Load required libraries
+
+```{r}
+suppressPackageStartupMessages(library(dplyr))
+# suppressPackageStartupMessages(library(Seurat)) # already loaded before
+suppressPackageStartupMessages(library(biomaRt)) # need a version which contains the `getHomologs()` function
+```
+
+2. Retrieve human cell cycle markers
+
+```{r}
+str(cc.genes.updated.2019) # built-in human cc markers
+
+# built a tibble for later use
+cc_genes <- tibble(
+  phase = unlist(mapply(rep, c("s", "g2m"), lapply(cc.genes.updated.2019, length))),
+  gene_name = unname(unlist(cc.genes.updated.2019))
+)
+cc_genes
+```
+
+Then we will use {`biomaRt`} to turn these genes into homologous genes of the target species,
+here we will use mouse as an example.
+
+3. Set up marts
+
+```{r}
+human <- useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+mouse <- useMart("ensembl", dataset = "mmusculus_gene_ensembl")
+```
+
+4. Get homologous genes
+
+```{r}
+#| error: true
+
+s_mouse <- getLDS(
+  attributes = c("hgnc_symbol"),
+  filters = "hgnc_symbol",
+  values = cc.genes.updated.2019$s.genes,
+  mart = human,
+  attributesL = c("hgnc_symbol"),
+  martL = mouse,
+  uniqueRows = TRUE
+)
+g2m_mouse <- getLDS(
+  attributes = c("hgnc_symbol"),
+  filters = "hgnc_symbol",
+  values = cc.genes.updated.2019$g2m.genes,
+  mart = human,
+  attributesL = c("hgnc_symbol"),
+  martL = mouse,
+  uniqueRows = TRUE
+)
+
+```
+
+The `getLDS()` funciontallity started failing with the release of BioMart 106,
+a new function `getHomologs()` can be help.
+(See discussion [here](https://support.bioconductor.org/p/9158791/))
+
+4.1 `getHomologs()` requires Ensembl gene ID as input,
+so we need to convert the human gene symbol to Ensembl ID.
+
+```{r}
+# retrieve human gene Ensembl ID
+ensembl_human <- getBM(
+  attributes = c(
+    "ensembl_gene_id",
+    "hgnc_symbol"
+  ),
+  filters = "hgnc_symbol",
+  values = unname(unlist(cc.genes.updated.2019)),
+  mart = human
+)
+
+head(ensembl_human)
+
+# add the Ensembl ID back to the cell cycle tibble
+cc_genes <- cc_genes |> left_join(
+  ensembl_human,
+  by = c("gene_name" = "hgnc_symbol")
+)
+cc_genes
+
+# be careful, sometimes one symbol can match 0 or multiple Ensembl ID
+multi_match <- count(cc_genes, gene_name) |> # multiple matches
+  filter(n > 1) |> 
+  pull(gene_name)
+
+filter(cc_genes, gene_name %in% multi_match | is.na(ensembl_gene_id))
+```
+
+```{r}
+#| eval: false
+
+# if there is 0 match, we can use synonym to retrieve Ensembl ID
+searchAttributes(human, "synonym") # get the attribute name
+ensembl_human_synonym <- getBM(
+  attributes = c(
+    "ensembl_gene_id",
+    "hgnc_symbol",
+    "external_synonym"
+  ),
+  filters = "external_synonym",
+  values = filter(cc_genes, is.na(ensembl_gene_id)) |> pull(gene_name),
+  mart = human
+)
+ensembl_human_synonym
+
+# add Ensembl ID to `cc_genes` table
+for (i in ensembl_human_synonym$external_synonym) {
+  cc_genes$ensembl_gene_id[cc_genes$gene_name == i] <- ensembl_human_synonym$ensembl_gene_id[ensembl_human_synonym$external_synonym == i]
+} # not the best way, you can do better ;)
+```
+
+4.2 Then we can start retrieving homologous genes:
+
+```{r}
+mouse_markers <- getHomologs(
+  ensembl_gene_ids = ensembl_human$ensembl_gene_id,
+  species_from = "human",
+  species_to = "mouse"
+)
+
+# you may still have some gene without match,
+# you can use the Ensembl web site to search manually.
+filter(mouse_markers, is.na(mmusculus_homolog_ensembl_gene) | mmusculus_homolog_ensembl_gene == "")
+```
+
+4.3 `getHomologs()` returns mouse Ensembl ID,
+now we need to convert them into gene symbol.
+
+```{r}
+ensembl_mouse <- getBM(
+  attributes = c(
+    "ensembl_gene_id",
+    "external_gene_name"
+  ),
+  filters = "ensembl_gene_id",
+  values = mouse_markers$mmusculus_homolog_ensembl_gene,
+  mart = mouse
+)
+head(ensembl_mouse)
+
+# rename column to avoid confusion
+names(ensembl_mouse) <- c("mouse_ensembl", "mouse_symbol")
+
+# add mouse gene symbol to the marker table
+mouse_markers <- left_join(
+  mouse_markers,
+  ensembl_mouse,
+  by = c("mmusculus_homolog_ensembl_gene" = "mouse_ensembl")
+)
+head(mouse_markers)
+
+```
+
+4.4 At the end, we will merge with phase information from human genes:
+
+```{r}
+final_markers <- full_join(cc_genes, mouse_markers, by = "ensembl_gene_id")
+
+head(final_markers)
+```
+
+Finally you get mouse versions of G1/S and G2/M marker genes and
+you can use them for cell cycle scoring.
+
+5. Apply to Seurat object (`seurat_obj`)
+
+```{r}
+# extract gene lists
+s_genes_mouse <- filter(
+  final_markers, phase == "s" & !is.na(mouse_symbol)
+) |>
+  pull(mouse_symbol) |>
+  unique()
+
+g2m_genes_mouse <- filter(
+  final_markers, phase == "g2m" & !is.na(mouse_symbol)
+) |>
+  pull(mouse_symbol) |>
+  unique()
+```
+
+```{r}
+#| eval: false
+
+# run cell cylce scoring
+seurat_obj <- CellCycleScoring(
+  seurat_obj,
+  s.features = s_genes_mouse,
+  g2m.features = g2m_genes_mouse,
+  set.ident = TRUE
+)
+```
+
