@@ -1,0 +1,278 @@
+---
+title: "DE Analysis with Seurat"
+format: 
+  html:
+    toc: true
+    toc-depth: 3
+embed-resources: true
+editor: source
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r}
+#| label: load-pkgs
+
+suppressPackageStartupMessages(library(Seurat))
+suppressPackageStartupMessages(library(SeuratData))
+suppressPackageStartupMessages(library(ggplot2))
+```
+
+```{r}
+#| label: import-data
+
+load("data/SC26_FMTG_FILTERED_CLUSTERS_ANNOTATED.rda")
+```
+
+
+```{r}
+head(sobj)
+table(sobj$RNA_snn_res.0.5_annot)
+```
+
+Based on the annotated data, we can then perform:
+
+- Default single cell level DE analysis
+  - between two cell types
+  - one cell type against the others
+- Compare expression between conditions within the same cell type
+  - single cell level (ignore the correlation between cells from the same sample)
+  - pseudo-bulk DE analysis
+
+
+## Default DE Analysis
+
+The Wilcoxon Rank Sum test is used as default.
+
+```{r}
+## set indentity if not done yet
+# Idents(sobj) <- "RNA_snn_res.0.5_annot"
+
+# identify DE features between CD8 and CD4_naive
+cd8.cd4.de.markers <- FindMarkers(sobj, ident.1 = "CD8", ident.2 = "CD4_naive")
+
+head(cd8.cd4.de.markers)
+
+FeaturePlot(object = sobj, features = head(rownames(cd8.cd4.de.markers)))
+```
+
+If the `ident.2` parameter is omitted or set to `NULL`, `FindMarkers()` will test for differentially expressed features between the group specified by ident.1 and all other cells.
+
+```{r}
+cd8.de.markers <- FindMarkers(sobj, ident.1 = "CD8", ident.2 = NULL)
+
+head(cd8.de.markers)
+
+FeaturePlot(object = sobj, features = head(rownames(cd8.de.markers)))
+```
+
+
+## Compare expression between conditions
+
+The first way is to compare gene expression between conditions within the same cell type.
+
+You just need to create a new Ident which combines the information of cell type and conditions.
+
+```{r}
+# aa <- SeuratData::AvailableData()
+# aa[which(aa$Dataset == "ifnb"), ]
+# SeuratData::InstallData("ifnb") # error: no pkg called 'ifnb.SeuratData'
+## try to install from source
+# install.packages(
+#   "https://seurat.nygenome.org/src/contrib/ifnb.SeuratData_3.0.0.tar.gz",
+#   repos = NULL, type = "source"
+# ) 
+suppressPackageStartupMessages(library(ifnb.SeuratData))
+ifnb <- LoadData("ifnb")
+head(ifnb)
+table(ifnb$stim, ifnb$seurat_annotations)
+
+# create a new identity
+ifnb$celltype.stim <- paste(ifnb$seurat_annotations, ifnb$stim, sep = "_")
+Idents(ifnb) <- "celltype.stim"
+head(ifnb)
+
+mono.de <- FindMarkers(
+  ifnb,
+  ident.1 = "CD14 Mono_STIM", ident.2 = "CD14 Mono_CTRL",
+  verbose = FALSE
+)
+head(mono.de)
+```
+
+But this method does not take into account the correlation between cells from the same sample, will lead to potential p-value inflation.
+
+### Psuedo-bulk Analysis
+
+To perform pseudo bulk DE analysis,
+we need to first aggregate expression of cells from the same sample for each cell type.
+`AggregateExpression()` function helps to return summed counts for each identity category,
+i.e., one count for each sample and each cell type.
+
+```{r}
+#| lable: add-sample-info
+#| code-fold: true
+
+# load the inferred sample IDs of each cell
+ctrl <- read.table(
+  url("https://raw.githubusercontent.com/yelabucsf/demuxlet_paper_code/master/fig3/ye1.ctrl.8.10.sm.best"),
+  head = TRUE, stringsAsFactors = FALSE
+)
+stim <- read.table(
+  url("https://raw.githubusercontent.com/yelabucsf/demuxlet_paper_code/master/fig3/ye2.stim.8.10.sm.best"),
+  head = TRUE, stringsAsFactors = FALSE
+)
+info <- rbind(ctrl, stim)
+
+# rename the cell IDs by substituting the '-' into '.'
+info$BARCODE <- gsub(pattern = "\\-", replacement = "\\.", info$BARCODE)
+
+# only keep the cells with high-confidence sample ID
+info <- info[grep(pattern = "SNG", x = info$BEST), ]
+
+# remove cells with duplicated IDs in both ctrl and stim groups
+info <- info[!duplicated(info$BARCODE) & !duplicated(info$BARCODE, fromLast = T), ]
+
+# now add the sample IDs to ifnb 
+rownames(info) <- info$BARCODE
+info <- info[, c("BEST"), drop = FALSE]
+names(info) <- c("donor_id")
+ifnb <- AddMetaData(ifnb, metadata = info)
+
+# remove cells without donor IDs
+ifnb$donor_id[is.na(ifnb$donor_id)] <- "unknown"
+ifnb <- subset(ifnb, subset = donor_id != "unknown")
+```
+
+
+```{r}
+#| label: aggregate-sample
+
+# sample info was added to meta data
+head(ifnb)
+table(ifnb$donor_id)
+
+# pseudobulk the counts based on donor-condition-celltype
+pseudo_ifnb <- AggregateExpression(
+  ifnb, assays = "RNA", return.seurat = TRUE,
+  group.by = c("stim", "donor_id", "seurat_annotations")
+)
+dim(ifnb)
+dim(pseudo_ifnb)
+# each 'cell' is a donor-condition-celltype pseudobulk profile
+head(pseudo_ifnb)
+tail(Cells(pseudo_ifnb))
+
+# recreate the new identity
+pseudo_ifnb$celltype.stim <- paste(
+  pseudo_ifnb$seurat_annotations, pseudo_ifnb$stim, sep = "_"
+)
+
+head(pseudo_ifnb)
+```
+
+
+Note: Another function `AverageExpression()` helps to calculate the average expression instead of the summed count.
+
+
+Then we can run DESeq2 analysis on sample level within specified cell type.
+
+```{r}
+# install.packages("DESeq2") # need to be installed before use this method
+
+Idents(pseudo_ifnb) <- "celltype.stim"
+
+bulk.mono.de <- FindMarkers(
+  object = pseudo_ifnb, 
+  ident.1 = "CD14 Mono_STIM", 
+  ident.2 = "CD14 Mono_CTRL",
+  test.use = "DESeq2"
+)
+
+head(bulk.mono.de)
+```
+
+Pseudo bulk DE analysis returns bigger p-values, when comparing with single cell level results, we can find there are genes which show DE at sc level but not at sample level.
+
+The implementation of DESeq2 in `FindMarkers()` allows only performing univariate analysis
+(see [here](https://github.com/satijalab/seurat/blob/9354a78887e66a3f7d9ba6b726aa44123ad2d4af/R/differential_expression.R#L1460)),
+i.e., test between conditions without taking into account other co-variables.
+If you want to perform a more sophisticated model, you can directly use functions from the {`DESeq2`} package.
+
+#### DESeq2
+
+For example, if we want to compare `CD14 Mono_STIM` vs `CD14 Mono_CTRL`:
+
+```{r}
+suppressPackageStartupMessages(library(DESeq2))
+
+table(pseudo_ifnb$seurat_annotations, pseudo_ifnb$stim)
+
+# subset CD14 Mono cells for all samples
+pseudo_ifnb_cd14mono <- subset(pseudo_ifnb, seurat_annotations == "CD14 Mono")
+
+dds <- DESeq2::DESeqDataSetFromMatrix(
+  countData = GetAssayData(object = pseudo_ifnb_cd14mono, layer = "counts"),
+  colData = pseudo_ifnb_cd14mono@meta.data,
+  design = ~ stim # here to modify the model
+)
+dds <- DESeq2::estimateSizeFactors(object = dds)
+# size factor accounts for diff seq depth across samples
+# sizeFactors(dds) # check the obtained size factor
+# sizeFactors(ddf) <- scran::computeSumFactors(dds) # recommended estimation
+dds <- DESeq2::estimateDispersions(object = dds, fitType = "local")
+# disperion mesures the variability, high expression -> low dispersion
+# plotDispEsts(dds)
+dds <- DESeq2::nbinomWaldTest(object = dds)
+resultsNames(dds) # names of estimated coefficients
+
+res <- DESeq2::results(
+  object = dds,
+  # contrast = c("stim", "STIM", "CTRL"),
+  name = "stim_STIM_vs_CTRL",
+  alpha = 0.05 # cutoff for independent filtering
+)
+summary(res)
+
+head(bulk.mono.de, 2)
+res[rownames(head(bulk.mono.de, 2)), ]
+
+# renv::install("bioc::apeglm")
+DESeq2::resultsNames(dds)
+res_shrink <- DESeq2::lfcShrink(
+  dds,
+  coef = "stim_STIM_vs_CTRL",
+  res = res,
+  type = "apeglm" # need install first "apeglm" pkg from Bioconductor
+)
+head(bulk.mono.de, 2)
+res_shrink[rownames(head(bulk.mono.de, 2)), ]
+res[rownames(head(bulk.mono.de, 2)), ]
+
+# same issues reported
+# https://github.com/satijalab/seurat/discussions/7763
+# https://github.com/satijalab/seurat/discussions/7764
+
+
+## How results look like if we use recommended params?
+ddsLRT <- DESeq(
+  dds, test = "LRT",
+  useT = TRUE, minmu = 1e-6, minReplicatesForReplace = Inf,
+  reduced = ~ 1
+)
+resLRT <- results(ddsLRT)
+head(bulk.mono.de, 2)
+resLRT[rownames(head(bulk.mono.de, 2)), ]
+```
+
+Check this [vignette](https://bioconductor.org/packages/devel/bioc/vignettes/DESeq2/inst/doc/DESeq2.html) for detailed explanation of DESeq2.
+
+Some important points to keep in mind:
+
+- DESeq2 use **un-normalized** counts as input, in the forme of an **integer** matrix.
+- DESeq2 use the first group in alphabetic order as reference group, you can change the reference group by reorder levels in group, or use the `contrast` parameter to specify the comparison when extracting results.
+- `results()` extracts by default the results of the last variable in the formula, if you want to change this behavior, each specify the `contrast` or `name` parameter in `results()`, or put the variable of interest at the last position in the formula.
+- When sample size is small or gene expression is low, the estimated log2FC is not stable as the variance is likely to be high. Use `lfcShrink()` to get shrunken log2FC.
+- Recommendations for using DESeq2 with scRNA seq data: <https://bioconductor.org/packages/release/bioc/vignettes/DESeq2/inst/doc/DESeq2.html#recommendations-for-single-cell-analysis>
+
+
